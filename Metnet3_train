@@ -1,0 +1,144 @@
+# Metnet3_train.py
+
+import torch
+from torch import nn, optim
+from torch.cuda.amp import autocast, GradScaler
+from Metnet3_modified import MetNet3Modified
+from Metnet3_dataloader import get_dataloaders
+from tqdm import tqdm
+
+
+def train_model():
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    model = MetNet3Modified(
+        dim=128,
+        num_times=6,
+        input_variables_sparse=6,
+        input_variables_dense=6,
+        input_variables_low=2,
+        target_channels_sparse=3,
+        target_channels_dense=6,
+        target_channels_high=1,
+        resnet_block_depth=2,
+        attn_depth=12,
+        attn_dim_head=64,
+        attn_heads=32,
+        attn_dropout=0.1,
+        vit_window_size=8,
+        crop_size_post=32,
+        upsample_scale_factor=2,
+    ).to(device)
+
+    # 손실 함수 설정 (reduction='none' 유지)
+    criterion = nn.MSELoss(reduction='none')
+    optimizer = optim.Adam(model.parameters(), lr=1e-5)  # 학습률 감소
+
+    scaler = GradScaler()
+
+    batch_size = 2  # 배치 크기 조정
+    train_loader, val_loader, _ = get_dataloaders(batch_size=batch_size)
+
+    num_epochs = 10
+
+    for epoch in range(num_epochs):
+        # --- Training Phase ---
+        model.train()
+        train_loss = 0.0
+
+        with tqdm(total=len(train_loader), desc=f'Epoch {epoch + 1}/{num_epochs} - Training', unit='batch') as pbar:
+            for batch in train_loader:
+                optimizer.zero_grad()
+
+                # Mixed Precision 사용
+                with autocast():
+                    sparse_input = batch['sparse_input'].to(device)  # [batch_size, 36, 32, 32]
+                    dense_input = batch['dense_input'].to(device)  # [batch_size, 36, 32, 32]
+                    low_input = batch['low_input'].to(device)  # [batch_size, 12, 32, 32]
+                    lead_times = batch['lead_times'].to(device)  # [batch_size, 1]
+
+                    surface_target = batch['sparse_target'].to(device)  # [batch_size, 3, 32, 32]
+                    dense_target = batch['dense_target'].to(device)  # [batch_size, 6, 32, 32]
+                    high_target = batch['high_target'].to(device)  # [batch_size, 1, 32, 32]
+
+                    mask_sparse_input = batch['mask_sparse_input'].to(device).bool()  # Boolean 타입으로 변환
+
+                    # 모델 예측
+                    surface_pred, dense_pred, high_pred = model(
+                        sparse_input, dense_input, low_input, lead_times
+                    )  # 각각 [batch_size, 3, 32, 32], [batch_size,6,32,32], [batch_size,1,32,32]
+
+                    # 손실 계산 시 마스크 적용 (훈련 시: 보간되지 않은 위치)
+                    loss_surface = criterion(surface_pred, surface_target)  # [batch_size, 3, 32, 32]
+                    loss_surface = loss_surface * mask_sparse_input  # [batch_size, 3, 32, 32]
+                    loss_surface = loss_surface.sum() / mask_sparse_input.sum()  # 평균 손실 계산
+
+                    loss_dense = criterion(dense_pred, dense_target).mean()
+                    loss_high = criterion(high_pred, high_target).mean()
+
+                    # 전체 손실
+                    loss = loss_surface + loss_dense + loss_high
+
+                # 역전파 및 최적화
+                scaler.scale(loss).backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)  # 그라디언트 클리핑
+                scaler.step(optimizer)
+                scaler.update()
+
+                train_loss += loss.item()
+                pbar.update(1)
+                pbar.set_postfix({'loss': f'{train_loss / (pbar.n):.4f}'})
+
+                # 불필요한 변수 삭제 및 캐시 정리
+                del sparse_input, dense_input, low_input, lead_times, surface_target, dense_target, high_target, surface_pred, dense_pred, high_pred, loss
+                torch.cuda.empty_cache()
+
+        # --- Validation Phase ---
+        model.eval()
+        val_loss = 0.0
+        with torch.no_grad():
+            with tqdm(total=len(val_loader), desc=f'Epoch {epoch + 1}/{num_epochs} - Validation', unit='batch') as pbar:
+                for batch in val_loader:
+                    sparse_input = batch['sparse_input'].to(device)  # [batch_size, 36, 32, 32]
+                    dense_input = batch['dense_input'].to(device)  # [batch_size, 36, 32, 32]
+                    low_input = batch['low_input'].to(device)  # [batch_size, 12, 32, 32]
+                    lead_times = batch['lead_times'].to(device)  # [batch_size, 1]
+
+                    surface_target = batch['sparse_target'].to(device)  # [batch_size, 3, 32, 32]
+                    dense_target = batch['dense_target'].to(device)  # [batch_size, 6, 32, 32]
+                    high_target = batch['high_target'].to(device)  # [batch_size, 1, 32, 32]
+
+                    mask_sparse_input = batch['mask_sparse_input'].to(device).bool()  # Boolean 타입으로 변환
+
+                    # 모델 예측
+                    surface_pred, dense_pred, high_pred = model(
+                        sparse_input, dense_input, low_input, lead_times
+                    )
+
+                    # 손실 계산 시 마스크 적용 (검증 시: 보간된 위치)
+                    mask_interpolated = ~mask_sparse_input  # [batch_size, 3, 32, 32]
+                    loss_surface = criterion(surface_pred, surface_target)  # [batch_size, 3, 32, 32]
+                    loss_surface = loss_surface * mask_interpolated  # [batch_size, 3, 32, 32]
+                    loss_surface = loss_surface.sum() / mask_interpolated.float().sum()  # 평균 손실 계산
+
+                    loss_dense = criterion(dense_pred, dense_target).mean()
+                    loss_high = criterion(high_pred, high_target).mean()
+
+                    loss = loss_surface + loss_dense + loss_high
+                    val_loss += loss.item()
+                    pbar.update(1)
+
+        avg_val_loss = val_loss / len(val_loader)
+        print(f'Epoch {epoch + 1}, Validation Loss: {avg_val_loss:.4f}')
+
+        # 모델 저장
+        torch.save(model.state_dict(), f'metnet3_epoch{epoch + 1}.pth')
+
+
+if __name__ == '__main__':
+    # 환경 변수 설정
+    import os
+
+    os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:128'
+
+    train_model()
