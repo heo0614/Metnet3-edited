@@ -1,180 +1,525 @@
-# Metnet3_dataloader.py
-
-import torch
-from torch.utils.data import Dataset, DataLoader
+import os
 import xarray as xr
 import numpy as np
-import torch.nn.functional as F
-import pandas as pd  # 선형 보간을 위해 추가
+from tqdm import tqdm
 
-class WeatherDataset(Dataset):
-    def __init__(self, sparse_input_path, dense_input_path, low_input_path,
-                 sparse_target_path, dense_target_path, high_target_path,
-                 transform=None, mode='train'):
-        self.sparse_input = xr.open_dataset(sparse_input_path)
-        self.dense_input = xr.open_dataset(dense_input_path)
-        self.low_input = xr.open_dataset(low_input_path)
-        self.sparse_target = xr.open_dataset(sparse_target_path)
-        self.dense_target = xr.open_dataset(dense_target_path)
-        self.high_target = xr.open_dataset(high_target_path)
+# -------------------------------------------------
+# (A) 경로 및 폴더 설정
+# -------------------------------------------------
+PATH_SPARSE_INPUT = r"/projects/aiid/KIPOT_SKT/Weather/sparse_data_input/156x156_sparse_0.5_input_all.nc"
+PATH_DENSE_INPUT  = r"/projects/aiid/KIPOT_SKT/Weather/dense_data_input/156x156_dense_0.5_input_all.nc"
+PATH_LOW_INPUT    = r"/projects/aiid/KIPOT_SKT/Weather/low_data_input/156x156_low_1.0_input_all.nc"
 
-        self.transform = transform
-        self.mode = mode
+PATH_HIGH_TARGET   = r"/projects/aiid/KIPOT_SKT/Weather/high_data_target/128x128_high_target_0.25_all.nc"
+PATH_SPARSE_TARGET = r"/projects/aiid/KIPOT_SKT/Weather/sparse_data_target/32x32_sparse_target_0.5_all.nc"
+PATH_DENSE_TARGET  = r"/projects/aiid/KIPOT_SKT/Weather/dense_data_target/32x32_dense_target_0.5_all.nc"
 
-        # 시간에 따른 슬라이딩 윈도우 생성
-        self.time_indices = self.create_time_indices()
+SAVE_DIR_TRAIN = r"/projects/aiid/KIPOT_SKT/Weather/trainset"
+SAVE_DIR_VALID = r"/projects/aiid/KIPOT_SKT/Weather/validationset"
+SAVE_DIR_TEST  = r"/projects/aiid/KIPOT_SKT/Weather/testset"
 
-    def create_time_indices(self):
-        total_times = len(self.sparse_input.time)
-        time_indices = []
-        for t in range(total_times - 7):  # 6시간 입력, 1시간 타겟 (t+1)
-            time_indices.append(t)
-        return time_indices
+def make_dirs_for_targets(base_dir, subfolders):
+    if not os.path.exists(base_dir):
+        os.makedirs(base_dir, exist_ok=True)
+    for sf in subfolders:
+        path_ = os.path.join(base_dir, sf)
+        os.makedirs(path_, exist_ok=True)
 
-    def __len__(self):
-        return len(self.time_indices)
+# -------------------------------------------------
+# (B) NetCDF 로드
+# -------------------------------------------------
+ds_sparse_input  = xr.open_dataset(PATH_SPARSE_INPUT)
+ds_dense_input   = xr.open_dataset(PATH_DENSE_INPUT)
+ds_low_input     = xr.open_dataset(PATH_LOW_INPUT)
 
-    def __getitem__(self, idx):
-        t = self.time_indices[idx]
+ds_high_target   = xr.open_dataset(PATH_HIGH_TARGET)
+ds_sparse_target = xr.open_dataset(PATH_SPARSE_TARGET)
+ds_dense_target  = xr.open_dataset(PATH_DENSE_TARGET)
 
-        # 입력 데이터 로드 (6시간씩)
-        sparse_input = self.sparse_input.isel(time=slice(t, t+6)).to_array().values  # [variables, times, lat, lon]
-        dense_input = self.dense_input.isel(time=slice(t, t+6)).to_array().values
-        low_input = self.low_input.isel(time=slice(t, t+6)).to_array().values
+# -------------------------------------------------
+# (C) 사용할 변수명들
+# -------------------------------------------------
+# sparse_input
+sparse_all_vars = list(ds_sparse_input.data_vars.keys())
+# 여기서 'total_precipitation'은 별도의 stale_state로 처리합니다.
+SPARSE_STALE_VAR = '2m_temperature'
+sparse_input_vars = [v for v in sparse_all_vars if v != SPARSE_STALE_VAR]
 
-        # 타겟 데이터 로드 (1시간 후의 첫 번째 시간 단계)
-        sparse_target = self.sparse_target.isel(time=t+6).to_array().values  # [variables, lat, lon]
-        dense_target = self.dense_target.isel(time=t+6).to_array().values
-        high_target = self.high_target.isel(time=t+6).to_array().values
+# dense_input
+dense_all_vars = list(ds_dense_input.data_vars.keys())
+dense_input_vars = dense_all_vars
 
-        # NaN 값 처리: 선형 보간을 사용하여 NaN 값을 채웁니다.
-        # xarray의 interpolate_na를 사용하여 lat과 lon 차원에서 선형 보간
-        sparse_input_ds = self.sparse_input.isel(time=slice(t, t+6)).interpolate_na(dim=['lat', 'lon'], method='linear', fill_value="extrapolate")
-        dense_input_ds = self.dense_input.isel(time=slice(t, t+6)).interpolate_na(dim=['lat', 'lon'], method='linear', fill_value="extrapolate")
-        low_input_ds = self.low_input.isel(time=slice(t, t+6)).interpolate_na(dim=['lat', 'lon'], method='linear', fill_value="extrapolate")
+# low_input
+low_all_vars = list(ds_low_input.data_vars.keys())
+low_input_vars = low_all_vars
 
-        sparse_input = sparse_input_ds.to_array().values  # [variables, times, lat, lon]
-        dense_input = dense_input_ds.to_array().values
-        low_input = low_input_ds.to_array().values
+# target variables
+sparse_target_vars = list(ds_sparse_target.data_vars.keys())
+high_target_vars   = list(ds_high_target.data_vars.keys())
 
-        # 타겟 데이터도 선형 보간 (안전하게 처리)
-        sparse_target_ds = self.sparse_target.isel(time=t+6).interpolate_na(dim=['lat', 'lon'], method='linear', fill_value="extrapolate")
-        dense_target_ds = self.dense_target.isel(time=t+6).interpolate_na(dim=['lat', 'lon'], method='linear', fill_value="extrapolate")
-        high_target_ds = self.high_target.isel(time=t+6).interpolate_na(dim=['lat', 'lon'], method='linear', fill_value="extrapolate")
+# (중요) dense_target: 여러 변수 (예: 6개) -> 합쳐서 (6시간 x 6변수 = 36채널)
+dense_target_vars = list(ds_dense_target.data_vars.keys())
 
-        sparse_target = sparse_target_ds.to_array().values  # [variables, lat, lon]
-        dense_target = dense_target_ds.to_array().values
-        high_target = high_target_ds.to_array().values
+# -------------------------------------------------
+# (E) 변수별 (min, max)와 bin 개수 설정
+# -------------------------------------------------
+variable_range_info = {
+    # 예시: sparse_input 등에서 쓰일 입력 범위
+    "2m_temperature":          (240.0, 330.0),
+    "2m_dewpoint_temperature": (235.0, 310.0),
+    "surface_pressure":        (40000.0, 105000.0),
+    "total_precipitation":     (0.0, 0.05),  # sparse target용 (0~0.05) 예시
+    "u_component_of_wind":     (-30.0, 50.0),
+    "v_component_of_wind":     (-25.0, 30.0),
 
-        # 채널 수를 6배로 늘려서 시간 축을 채널 축으로 변환 (6시간 * 기존 채널 수)
-        # 예를 들어, 기존 채널 수가 6개라면, 6시간 데이터는 6*6=36채널로 변환
-        # 현재 sparse_input은 [variables, times, lat, lon]
-        # 시간 및 변수 차원을 채널 차원으로 병합
-        # 새로운 채널 수 = variables * times
-        sparse_input = np.transpose(sparse_input, (1, 0, 2, 3))  # [times, variables, lat, lon]
-        sparse_input = sparse_input.reshape(-1, sparse_input.shape[2], sparse_input.shape[3])  # [channels=times*variables, lat, lon]
+    # dense_input
+    "geopotential":            (120000.0, 135000.0),
+    "land_sea_mask":           (0.0, 1.0),
+    "temperature":             (240.0, 280.0),
+    "10m_u_component_of_wind": (-25.0, 25.0),
+    "10m_v_component_of_wind": (-25.0, 25.0),
+    "specific_humidity":       (0.0001, 0.01),
 
-        dense_input = np.transpose(dense_input, (1, 0, 2, 3))
-        dense_input = dense_input.reshape(-1, dense_input.shape[2], dense_input.shape[3])
+    # target 변수
+    "2m_temperature_target":    (280.0, 330.0),
+    "2m_dewpoint_temperature_target": (285.0, 305.0),
 
-        low_input = np.transpose(low_input, (1, 0, 2, 3))
-        low_input = low_input.reshape(-1, low_input.shape[2], low_input.shape[3])
+    # 아래는 high target용 : "total_precipitation_target"
+    #   (원본 범위 0.0~??) 예시로 0.0~0.05
+    "total_precipitation_target": (0.0, 0.05),
 
-        # 마스크 생성: NaN이 아닌 위치는 1, NaN은 0
-        mask_sparse_input = ~np.isnan(sparse_input)  # [channels, lat, lon]
+    "u_component_of_wind_target": (-30.0, 50.0),
+    "v_component_of_wind_target": (-25.0, 30.0),
+}
 
-        # 마스크 다운샘플링 (32x32로)
-        mask_sparse_input_tensor = torch.from_numpy(mask_sparse_input).float()  # [channels, lat, lon]
-        mask_sparse_input_down = F.interpolate(mask_sparse_input_tensor.unsqueeze(0), size=(32,32), mode='nearest').squeeze(0)  # [channels,32,32]
+target_bins = {
+    # (1) sparse target 강수량 => "total_precipitation"는 256 bins (0..255)
+    "total_precipitation": 256,
 
-        # surface 변수만 추출 (예: 첫 3 변수 * 6시간 = 18채널)
-        target_channels_sparse = 3
-        input_variables_sparse = 6
-        num_input_steps = 6
-        # 각 변수별 6시간 채널을 분리
-        mask_sparse_surface = mask_sparse_input_down[:target_channels_sparse * num_input_steps].view(target_channels_sparse, num_input_steps, 32, 32)  # [3,6,32,32]
+    # (2) high target 강수량 => "total_precipitation_target"는 512 bins (0..511)
+    "total_precipitation_target": 512,
 
-        # 채널을 유지하면서 마스크를 사용할 수 있도록 변경
-        # 여기서는 타겟이 1시간 데이터이므로, 전체 마스크를 사용하는 대신 마지막 시간 단계의 마스크를 사용
-        # 또는 타겟 변수에 대한 마스크를 사용
-        # 예를 들어, 마지막 시간 단계의 마스크를 사용할 수 있습니다.
-        # 하지만 타겟은 1시간 후이므로, 마스크는 타겟 공간의 유효성을 나타내야 합니다.
-        # 따라서, 타겟 변수에 대한 마스크를 별도로 생성합니다.
-        # 여기서는 타겟이 surface 변수이므로, 마지막 시간 단계의 surface 변수 마스크를 사용합니다.
+    "2m_temperature": 256,
+    "2m_dewpoint_temperature": 256,
+    "surface_pressure": 256,
+    "u_component_of_wind": 256,
+    "v_component_of_wind": 256,
 
-        # 마지막 시간 단계의 surface 변수 마스크 추출
-        mask_sparse_surface_last = mask_sparse_surface[:, -1, :, :]  # [3,32,32]
+    "geopotential": 256,
+    "land_sea_mask": 2,
+    "temperature": 256,
+    "10m_u_component_of_wind": 256,
+    "10m_v_component_of_wind": 256,
+    "specific_humidity": 256,
+    "total_cloud_cover": 256,
 
-        # 필요한 전처리 적용 (예: 리사이즈)
-        if self.transform:
-            sparse_input = self.transform(sparse_input)
-            dense_input = self.transform(dense_input)
-            low_input = self.transform(low_input)
-            sparse_target = self.transform(sparse_target)
-            dense_target = self.transform(dense_target)
-            high_target = self.transform(high_target)
-            mask_sparse_surface_last = self.transform(mask_sparse_surface_last.numpy())  # numpy로 변환 후 transform
+    # (기타 ... 필요한 것 추가)
+}
 
-        # 리드 타임 생성
-        lead_times = torch.tensor([t], dtype=torch.long)
+# -------------------------------------------------
+# (E-1) 입력 변수별 정규화 정보 설정 (Min-Max 정규화)
+# -------------------------------------------------
+variable_norm_info = {
+    # sparse_input
+    "2m_temperature":          (240.0, 330.0),
+    "2m_dewpoint_temperature": (235.0, 310.0),
+    "u_component_of_wind":     (-30.0, 50.0),
+    "v_component_of_wind":     (-25.0, 30.0),
 
-        if np.isnan(sparse_input).any():
-            raise ValueError("NaN detected in sparse_input after interpolation")
-        if np.isnan(dense_input).any():
-            raise ValueError("NaN detected in dense_input after interpolation")
-        if np.isnan(low_input).any():
-            raise ValueError("NaN detected in low_input after interpolation")
-        if np.isnan(sparse_target).any():
-            raise ValueError("NaN detected in sparse_target after interpolation")
-        if np.isnan(dense_target).any():
-            raise ValueError("NaN detected in dense_target after interpolation")
-        if np.isnan(high_target).any():
-            raise ValueError("NaN detected in high_target after interpolation")
+    # dense_input
+    "geopotential":            (120000.0, 135000.0),
+    "land_sea_mask":           (0.0, 1.0),
+    "temperature":             (240.0, 280.0),
+    "10m_u_component_of_wind": (-25.0, 25.0),
+    "10m_v_component_of_wind": (-25.0, 25.0),
+    "specific_humidity":       (0.0001, 0.01),
 
-        mask_sparse_input = (mask_sparse_input > 0).astype(np.bool_)
+    # low_input
+    "total_cloud_cover":       (0.0, 1.0),
+}
 
-        # 마스크 변환 및 경고 해결
-        if isinstance(mask_sparse_surface_last, np.ndarray):
-            # Numpy 배열인 경우
-            mask_sparse_surface_tensor = torch.from_numpy(mask_sparse_surface_last).float()  # [3,32,32]
-        elif isinstance(mask_sparse_surface_last, torch.Tensor):
-            # 이미 텐서인 경우
-            mask_sparse_surface_tensor = mask_sparse_surface_last.clone().detach()  # [3,32,32]
+# -------------------------------------------------
+# (D) Dataset -> (time, channel, lat, lon) 변환 함수
+# -------------------------------------------------
+def dataset_to_array(ds: xr.Dataset, var_list: list):
+    arrays = []
+    for var in var_list:
+        data_3d = ds[var].values  # shape=(time, lat, lon)
+        data_4d = data_3d[:, np.newaxis, :, :]  # (time,1,lat,lon)
+        arrays.append(data_4d)
+    return np.concatenate(arrays, axis=1)  # (time, #vars, lat, lon)
+
+def make_input_array(full_array, start_idx, window_size=6):
+    slice_ = full_array[start_idx : start_idx + window_size]  # (time,#vars,H,W)
+    slice_transposed = slice_.transpose(1, 0, 2, 3)           # (#vars,time,H,W)
+    return slice_transposed.reshape(-1, slice_transposed.shape[2], slice_transposed.shape[3])
+
+# -------------------------------------------------
+# (F) 정규화 함수 (Min-Max)
+# -------------------------------------------------
+def normalize_array(var_name: str, arr: np.ndarray) -> np.ndarray:
+    if var_name == "total_precipitation":
+        transformed = log_tanh_transform(arr)
+        return transformed.astype(np.float32)
+    
+    if var_name in variable_norm_info:
+        vmin, vmax = variable_norm_info[var_name]
+    else:
+        vmin = float(np.nanmin(arr))
+        vmax = float(np.nanmax(arr))
+        if vmin == vmax:
+            vmax = vmin + 1e-5
+
+    normalized = (arr - vmin) / (vmax - vmin)
+    normalized = np.clip(normalized, 0.0, 1.0)
+    return normalized.astype(np.float32)
+
+# -------------------------------------------------
+# (E-2) 타겟 스케일링 함수 (연속값 -> 정수 bin index)
+# -------------------------------------------------
+def linear_scale_and_clamp_to_int(var_name: str, arr: np.ndarray, subfolder: str = None) -> np.ndarray:
+    """
+    subfolder에 따라, total_precipitation의 bin 수를 달리 적용:
+      - sparse_target -> 256 bin
+      - high_target   -> 512 bin
+    """
+    # 우선 기본적으로 min/max 범위를 잡음
+    if var_name in variable_range_info:
+        (vmin, vmax) = variable_range_info[var_name]
+    else:
+        vmin = float(np.nanmin(arr))
+        vmax = float(np.nanmax(arr))
+        if vmin == vmax:
+            vmax = vmin + 1e-5
+
+    # 기본적으로 target_bins를 사용
+    nbins = target_bins.get(var_name, 256)
+
+    # subfolder + var_name 조합에 따라 별도 처리
+    if var_name == "total_precipitation":
+        if subfolder == "sparse_target":
+            nbins = 256
+        elif subfolder == "high_target":
+            nbins = 512
+        # else: 그대로 nbins 유지
+    # 만약 'total_precipitation_target' 등 다른 변수명으로 구분하셨다면
+    # 여기서도 추가 분기 가능
+
+    # 실제 스케일링
+    arr_scaled = (arr - vmin) / (vmax - vmin) * (nbins - 1)
+    np.clip(arr_scaled, 0, nbins-1, out=arr_scaled)
+    arr_scaled = np.round(arr_scaled).astype(np.int32)
+
+    return arr_scaled
+
+def log_tanh_transform(arr: np.ndarray) -> np.ndarray:
+    """
+    arr >= 0 에서만 동작.
+    val_log = log(val + 1)/4
+    val_tanh = tanh(val_log) => [-1,1]
+    => [0,1]로 매핑
+    """
+    arr_clip = np.clip(arr, 0, None)
+    val_log  = np.log1p(arr_clip) / 4.0
+    val_tanh = np.tanh(val_log)
+    val_norm = (val_tanh + 1.0)/2.0
+    return val_norm
+
+# -------------------------------------------------
+# (F) 메인 전처리 함수
+# -------------------------------------------------
+def main():
+    print("[1] 각 Dataset을 (time, channel, lat, lon) 형태로 변환합니다.")
+    arr_sparse_input  = dataset_to_array(ds_sparse_input,  sparse_input_vars)
+    arr_stale_state   = dataset_to_array(ds_sparse_input,  [SPARSE_STALE_VAR])
+    arr_dense_input   = dataset_to_array(ds_dense_input,   dense_input_vars)
+    arr_low_input     = dataset_to_array(ds_low_input,     low_input_vars)
+
+    arr_sparse_target = dataset_to_array(ds_sparse_target, sparse_target_vars)
+    arr_high_target   = dataset_to_array(ds_high_target,   high_target_vars)
+    arr_dense_target  = dataset_to_array(ds_dense_target,  dense_target_vars)
+
+    print("  shapes:")
+    print(f"    sparse_input : {arr_sparse_input.shape}")
+    print(f"    stale_state  : {arr_stale_state.shape}")
+    print(f"    dense_input  : {arr_dense_input.shape}")
+    print(f"    low_input    : {arr_low_input.shape}")
+    print(f"    sparse_target: {arr_sparse_target.shape}")
+    print(f"    dense_target : {arr_dense_target.shape}  (all vars merged)")
+    print(f"    high_target  : {arr_high_target.shape}")
+
+    TIME_WINDOW_INPUT  = 6
+    TIME_WINDOW_TARGET = 6
+
+    total_time = arr_sparse_input.shape[0]
+    max_start = total_time - (TIME_WINDOW_INPUT + TIME_WINDOW_TARGET)
+
+    TRAIN_END = 720
+    VALID_END = 1056
+    TEST_END  = 1392
+
+    subfolders = [
+        "sparse_target", "dense_target", "high_target",
+        "input_sparse", "input_stale", "input_dense", "input_low"
+    ]
+    make_dirs_for_targets(SAVE_DIR_TRAIN, subfolders)
+    make_dirs_for_targets(SAVE_DIR_VALID, subfolders)
+    make_dirs_for_targets(SAVE_DIR_TEST,  subfolders)
+
+    sparse_input_train = []
+    sparse_input_valid = []
+    sparse_input_test  = []
+
+    stale_state_train  = []
+    stale_state_valid  = []
+    stale_state_test   = []
+
+    dense_input_train = []
+    dense_input_valid = []
+    dense_input_test  = []
+
+    low_input_train   = []
+    low_input_valid   = []
+    low_input_test    = []
+
+    sparse_target_train_dict = {v: [] for v in sparse_target_vars}
+    sparse_target_valid_dict = {v: [] for v in sparse_target_vars}
+    sparse_target_test_dict  = {v: [] for v in sparse_target_vars}
+
+    high_target_train_dict   = {v: [] for v in high_target_vars}
+    high_target_valid_dict   = {v: [] for v in high_target_vars}
+    high_target_test_dict    = {v: [] for v in high_target_vars}
+
+    dense_target_train = []
+    dense_target_valid = []
+    dense_target_test  = []
+
+    print(f"[2] 슬라이딩 윈도우 진행: 총 {max_start+1}개 샘플 예상.")
+    for start_idx in tqdm(range(max_start + 1)):
+        target_start = start_idx + TIME_WINDOW_INPUT
+        target_end   = target_start + TIME_WINDOW_TARGET
+
+        if target_start <= TRAIN_END:
+            split = "train"
+        elif TRAIN_END < target_start <= VALID_END:
+            split = "valid"
+        elif VALID_END < target_start <= TEST_END:
+            split = "test"
         else:
-            raise TypeError("mask_sparse_surface_last의 타입이 지원되지 않습니다.")
+            continue
 
-        return {
-            'sparse_input': torch.from_numpy(sparse_input).float(),  # [channels=variables*times, lat, lon]
-            'dense_input': torch.from_numpy(dense_input).float(),
-            'low_input': torch.from_numpy(low_input).float(),
-            'sparse_target': torch.from_numpy(sparse_target).float(),
-            'dense_target': torch.from_numpy(dense_target).float(),
-            'high_target': torch.from_numpy(high_target).float(),
-            'mask_sparse_input': mask_sparse_surface_tensor,  # [3,32,32]
-            'lead_times': lead_times
+        # (A) Inputs (6시간)
+        si = make_input_array(arr_sparse_input, start_idx, TIME_WINDOW_INPUT)
+        st = make_input_array(arr_stale_state,  start_idx, TIME_WINDOW_INPUT)
+        di = make_input_array(arr_dense_input,  start_idx, TIME_WINDOW_INPUT)
+        li = make_input_array(arr_low_input,    start_idx, TIME_WINDOW_INPUT)
+
+        if split == "train":
+            sparse_input_train.append(si[None, ...])
+            stale_state_train.append(st[None, ...])
+            dense_input_train.append(di[None, ...])
+            low_input_train.append(li[None, ...])
+        elif split == "valid":
+            sparse_input_valid.append(si[None, ...])
+            stale_state_valid.append(st[None, ...])
+            dense_input_valid.append(di[None, ...])
+            low_input_valid.append(li[None, ...])
+        else:
+            sparse_input_test.append(si[None, ...])
+            stale_state_test.append(st[None, ...])
+            dense_input_test.append(di[None, ...])
+            low_input_test.append(li[None, ...])
+
+        # (B) sparse_target (6시간)
+        st_full = arr_sparse_target[target_start:target_end]
+        for var in sparse_target_vars:
+            vidx = sparse_target_vars.index(var)
+            var_data = st_full[:, vidx]  # (6,H,W)
+            if split == "train":
+                sparse_target_train_dict[var].append(var_data[None, ...])
+            elif split == "valid":
+                sparse_target_valid_dict[var].append(var_data[None, ...])
+            else:
+                sparse_target_test_dict[var].append(var_data[None, ...])
+
+        # (C) dense_target (6시간, #vars)
+        dt_full = arr_dense_target[target_start:target_end]  # (6,C,H,W)
+        dt_full = dt_full[None, ...]                         # (1,6,C,H,W)
+        if split == "train":
+            dense_target_train.append(dt_full)
+        elif split == "valid":
+            dense_target_valid.append(dt_full)
+        else:
+            dense_target_test.append(dt_full)
+
+        # (D) high_target (6시간)
+        ht_full = arr_high_target[target_start:target_end]   # (6,C,H,W)
+        for var in high_target_vars:
+            vidx = high_target_vars.index(var)
+            var_data = ht_full[:, vidx]
+            if split == "train":
+                high_target_train_dict[var].append(var_data[None, ...])
+            elif split == "valid":
+                high_target_valid_dict[var].append(var_data[None, ...])
+            else:
+                high_target_test_dict[var].append(var_data[None, ...])
+
+    # ---------------------------------------------------
+    # (G) 저장 함수들 (입력 및 타겟)
+    # ---------------------------------------------------
+    def save_input_list(folder, name, array_list):
+        if not array_list:
+            print(f"  -> {name} list is empty, skip saving.")
+            return
+        arr = np.concatenate(array_list, axis=0)  # (N, C*window, H, W)
+
+        if name.startswith("input_sparse"):
+            var_list = sparse_input_vars
+        elif name.startswith("input_stale"):
+            var_list = [SPARSE_STALE_VAR]
+        elif name.startswith("input_dense"):
+            var_list = dense_input_vars
+        elif name.startswith("input_low"):
+            var_list = low_input_vars
+        else:
+            var_list = []
+
+        window_size = 6
+        normalized_channels = []
+        for c_idx, var in enumerate(var_list):
+            for w in range(window_size):
+                channel_idx = c_idx * window_size + w
+                channel_data = arr[:, channel_idx, :, :]
+                normalized = normalize_array(var, channel_data)
+                normalized_channels.append(normalized)
+        normalized_arr = np.stack(normalized_channels, axis=1)
+        out_path = os.path.join(folder, f"{name}_normalized.npy")
+        np.save(out_path, normalized_arr)
+        print(f"  -> Saved {name}_normalized: shape = {normalized_arr.shape} -> {out_path}")
+
+    def save_target_dict(folder, subfolder, target_dict, var_list):
+        outdir = os.path.join(folder, subfolder)
+        for var in var_list:
+            arr_list = target_dict[var]  # 예: (N,6,H,W) 쌓여있는 리스트
+            if not arr_list:
+                print(f"  -> {var} list is empty, skip.")
+                continue
+            arr_cat = np.concatenate(arr_list, axis=0)  # shape=(N,6,H,W)
+            orig_shape = arr_cat.shape
+
+            # reshape to (N*6,H,W) for scaling
+            reshaped_2d = arr_cat.reshape(-1, orig_shape[-2], orig_shape[-1])
+
+            # subfolder 정보를 인자로 전달
+            scaled_2d = linear_scale_and_clamp_to_int(var, reshaped_2d, subfolder=subfolder)
+
+            arr_scaled = scaled_2d.reshape(orig_shape)
+            fpath = os.path.join(outdir, f"{var}.npy")
+            np.save(fpath, arr_scaled)
+            print(f"  -> Saved {subfolder}/{var}.npy : shape={arr_scaled.shape}")
+
+    def save_dense_target_as_one_file(folder, arr_list, file_name="dense_target"):
+        if not arr_list:
+            print(f"  -> {file_name} list is empty, skip saving.")
+            return
+        arr_cat = np.concatenate(arr_list, axis=0)  # (N, T, C, H, W)
+        N, T, C, H, W = arr_cat.shape
+        arr_cat = arr_cat.transpose(0, 2, 1, 3, 4)  # (N,C,T,H,W)
+        dense_var_order = [
+            "geopotential",
+            "land_sea_mask",
+            "temperature",
+            "10m_u_component_of_wind",
+            "10m_v_component_of_wind",
+            "specific_humidity"
+        ]
+        channel_minmaxbins = {
+            "land_sea_mask": dict(vmin=0.0, vmax=1.0, bins=2),
+            "geopotential": dict(vmin=127000, vmax=129500, bins=256),
+            "temperature": dict(vmin=253.0, vmax=258.0, bins=256),
+            "10m_u_component_of_wind": dict(vmin=-15.0, vmax=20.0, bins=256),
+            "10m_v_component_of_wind": dict(vmin=-20.0, vmax=20.0, bins=256),
+            "specific_humidity": dict(vmin=0.0030, vmax=0.0075, bins=256),
         }
 
-def get_dataloaders(batch_size=8):
-    dataset = WeatherDataset(
-        sparse_input_path='E:/metnet3/weather_bench/sparse_data(40)_input/156x156_sparse_0.5_input(40del)_all.nc',
-        dense_input_path='E:/metnet3/weather_bench/dense_data_input/156x156_dense_0.5_input_all.nc',
-        low_input_path='E:/metnet3/weather_bench/low_data_input/156x156_low_1.0_input_all.nc',
-        sparse_target_path='E:/metnet3/weather_bench/sparse_data_target/32x32_sparse_target_0.5_all.nc',
-        dense_target_path='E:/metnet3/weather_bench/dense_data_target/32x32_dense_target_0.5_all.nc',
-        high_target_path='E:/metnet3/weather_bench/high_data_target/64x64_high_target_0.25_all.nc',
-    )
+        def scale_channel(ch_data, var_name):
+            shape_4d = ch_data.shape  # (N,T,H,W)
+            arr_2d = ch_data.reshape(-1, shape_4d[-2], shape_4d[-1])
+            d = channel_minmaxbins[var_name]
+            scaled = (arr_2d - d['vmin']) / (d['vmax'] - d['vmin']) * (d['bins'] - 1)
+            np.clip(scaled, 0, d['bins'] - 1, out=scaled)
+            scaled = np.round(scaled).astype(np.int32)
+            return scaled.reshape(shape_4d)
 
-    total_size = len(dataset)
-    train_size = int(0.7 * total_size)
-    val_size = int(0.15 * total_size)
-    test_size = total_size - train_size - val_size
+        for var_idx, var_name in enumerate(dense_var_order):
+            if var_name == "land_sea_mask":
+                continue  # skip or handle separately
+            ch_data = arr_cat[:, var_idx]
+            arr_cat[:, var_idx] = scale_channel(ch_data, var_name)
 
-    train_dataset, val_dataset, test_dataset = torch.utils.data.random_split(
-        dataset, [train_size, val_size, test_size]
-    )
+        arr_cat = arr_cat.reshape(N, C*T, H, W)
+        out_path = os.path.join(folder, f"{file_name}.npy")
+        np.save(out_path, arr_cat)
+        print(f"  -> Saved {file_name}.npy (channelwise scaled) : shape = {arr_cat.shape}")
 
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=0)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=0)
+    def save_normalized_input_list(folder, name, array_list, var_list):
+        if not array_list:
+            print(f"  -> {name} list is empty, skip saving.")
+            return
+        arr = np.concatenate(array_list, axis=0)  # (N, C*6, H, W)
+        window_size = 6
+        normalized_channels = []
+        for c_idx, var in enumerate(var_list):
+            for w in range(window_size):
+                channel_idx = c_idx * window_size + w
+                channel_data = arr[:, channel_idx, :, :]
+                normalized = normalize_array(var, channel_data)
+                normalized_channels.append(normalized)
+        normalized_arr = np.stack(normalized_channels, axis=1)
+        out_path = os.path.join(folder, f"{name}_normalized.npy")
+        np.save(out_path, normalized_arr)
+        print(f"  -> Saved {name}_normalized: shape = {normalized_arr.shape} -> {out_path}")
 
-    return train_loader, val_loader, test_loader
+    def save_all_inputs(folder, name, array_list, var_list):
+        save_normalized_input_list(folder, name, array_list, var_list)
+
+    def save_inputs(folder, name, array_list, var_list):
+        save_all_inputs(folder, name, array_list, var_list)
+
+    print("\n[3] 저장을 시작합니다.\n")
+
+    # ----------- Train -----------
+    save_inputs(SAVE_DIR_TRAIN, "input_sparse", sparse_input_train, sparse_input_vars)
+    save_inputs(SAVE_DIR_TRAIN, "input_stale",  stale_state_train, [SPARSE_STALE_VAR])
+    save_inputs(SAVE_DIR_TRAIN, "input_dense",  dense_input_train, dense_input_vars)
+    save_inputs(SAVE_DIR_TRAIN, "input_low",    low_input_train,   low_input_vars)
+
+    save_target_dict(SAVE_DIR_TRAIN, "sparse_target", sparse_target_train_dict, sparse_target_vars)
+    save_dense_target_as_one_file(SAVE_DIR_TRAIN, dense_target_train, "dense_target")
+    save_target_dict(SAVE_DIR_TRAIN, "high_target", high_target_train_dict, high_target_vars)
+
+    # ----------- Valid -----------
+    save_inputs(SAVE_DIR_VALID, "input_sparse", sparse_input_valid, sparse_input_vars)
+    save_inputs(SAVE_DIR_VALID, "input_stale",  stale_state_valid, [SPARSE_STALE_VAR])
+    save_inputs(SAVE_DIR_VALID, "input_dense",  dense_input_valid, dense_input_vars)
+    save_inputs(SAVE_DIR_VALID, "input_low",    low_input_valid,   low_input_vars)
+
+    save_target_dict(SAVE_DIR_VALID, "sparse_target", sparse_target_valid_dict, sparse_target_vars)
+    save_dense_target_as_one_file(SAVE_DIR_VALID, dense_target_valid, "dense_target")
+    save_target_dict(SAVE_DIR_VALID, "high_target", high_target_valid_dict, high_target_vars)
+
+    # ----------- Test ------------
+    save_inputs(SAVE_DIR_TEST, "input_sparse", sparse_input_test, sparse_input_vars)
+    save_inputs(SAVE_DIR_TEST, "input_stale",  stale_state_test, [SPARSE_STALE_VAR])
+    save_inputs(SAVE_DIR_TEST, "input_dense",  dense_input_test, dense_input_vars)
+    save_inputs(SAVE_DIR_TEST, "input_low",    low_input_test,   low_input_vars)
+
+    save_target_dict(SAVE_DIR_TEST, "sparse_target", sparse_target_test_dict, sparse_target_vars)
+    save_dense_target_as_one_file(SAVE_DIR_TEST, dense_target_test, "dense_target")
+    save_target_dict(SAVE_DIR_TEST, "high_target", high_target_test_dict, high_target_vars)
+
+    print("\n[완료] 모든 Numpy 저장이 끝났습니다.")
+
+
+if __name__ == "__main__":
+    main()
