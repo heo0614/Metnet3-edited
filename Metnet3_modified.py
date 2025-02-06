@@ -1,5 +1,3 @@
-# Metnet_modified.py
-
 from pathlib import Path
 from functools import partial
 from collections import namedtuple
@@ -705,172 +703,420 @@ LossBreakdown = namedtuple('LossBreakdown', [
 ])
 
 
-class MetNet3Modified(Module):
+class MetNet3(Module):
+    @beartype
     def __init__(
-        self,
-        *,
-        dim=512,
-        num_times=6,  # 시간 단계 수
-        input_variables_sparse=6,   # sparse_input의 변수 수
-        input_variables_dense=6,    # dense_input의 변수 수
-        input_variables_low=2,      # low_input의 변수 수
-        target_channels_sparse=3,   # sparse_target의 변수 수
-        target_channels_dense=6,    # dense_target의 변수 수
-        target_channels_high=1,     # high_target의 변수 수
-        resnet_block_depth=2,
-        attn_depth=12,
-        attn_dim_head=64,
-        attn_heads=32,
-        attn_dropout=0.1,
-        vit_window_size=8,
-        crop_size_post=32,
-        upsample_scale_factor=2,
+            self,
+            *,
+            dim=512,
+            num_lead_times=722,
+            lead_time_embed_dim=32,
+            input_spatial_size=624,
+            attn_depth=12,
+            attn_dim_head=64,
+            attn_heads=32,
+            attn_dropout=0.1,
+            vit_window_size=8,
+            vit_mbconv_expansion_rate=4,
+            vit_mbconv_shrinkage_rate=0.25,
+            input_2496_channels=2 + 14 + 1 + 2 + 20,
+            input_4996_channels=16 + 1,
+            surface_and_hrrr_target_spatial_size=128,
+            precipitation_target_bins: Dict[str, int] = dict(
+                mrms_rate=512,
+                mrms_accumulation=512
+            ),
+            surface_target_bins: Dict[str, int] = dict(
+                omo_temperature=256,
+                omo_dew_point=256,
+                omo_wind_speed=256,
+                omo_wind_component_x=256,
+                omo_wind_component_y=256,
+                omo_wind_direction=180
+            ),
+            hrrr_norm_strategy: Union[
+                Literal['none'],
+                Literal['precalculated'],
+                Literal['sync_batchnorm']
+            ] = 'none',
+            hrrr_channels=617,
+            hrrr_norm_statistics: Optional[Tensor] = None,
+            hrrr_loss_weight=10,
+            crop_size_post_16km=48,
+            resnet_block_depth=2,
     ):
         super().__init__()
 
-        # 입력 채널 수  (시간*변수)
-        self.input_channels_sparse = input_variables_sparse * num_times
-        self.input_channels_dense = input_variables_dense * num_times
-        self.input_channels_low = input_variables_low * num_times
+        # for autosaving the config
 
-        # 타겟 채널 수
-        self.target_channels_sparse = target_channels_sparse
-        self.target_channels_dense = target_channels_dense
-        self.target_channels_high = target_channels_high
+        _locals = locals()
+        _locals.pop('self', None)
+        _locals.pop('__class__', None)
+        _locals.pop('hrrr_norm_statistics', None)
+        self._configs = pickle.dumps(_locals)
 
-        # 리드 타임 임베딩 설정
-        self.lead_time_embedding = nn.Embedding(1464, dim)
+        self.hrrr_input_2496_shape = (hrrr_channels, input_spatial_size, input_spatial_size)
+        self.input_2496_shape = (input_2496_channels, input_spatial_size, input_spatial_size)
+        self.input_4996_shape = (input_4996_channels, input_spatial_size, input_spatial_size)
 
-        # sparse_input과 dense_input을 임베딩하고 concat
-        self.sparse_dense_embed = nn.Conv2d(
-            self.input_channels_sparse + self.input_channels_dense, dim, kernel_size=1
+        self.surface_and_hrrr_target_spatial_size = surface_and_hrrr_target_spatial_size
+
+        self.surface_target_shape = ((self.surface_and_hrrr_target_spatial_size,) * 2)
+        self.hrrr_target_shape = (hrrr_channels, *self.surface_target_shape)
+        self.precipitation_target_shape = (surface_and_hrrr_target_spatial_size * 4,) * 2
+
+        self.lead_time_embedding = nn.Embedding(num_lead_times, lead_time_embed_dim)
+        #(stale channel 변경)
+        stale_channels = 6
+        dim_in_4km = hrrr_channels + input_2496_channels + stale_channels
+
+        self.to_skip_connect_4km = CenterCrop(crop_size_post_16km * 4)
+
+        self.resnet_blocks_down_4km = ResnetBlocks(
+            dim=dim,
+            dim_in=dim_in_4km,
+            cond_dim=lead_time_embed_dim,
+            depth=resnet_block_depth
         )
 
-        # 2개의 ResNet 블록 통과 (cond_dim 추가)
-        self.resnet_blocks1 = ResnetBlocks(
-            dim=dim, depth=resnet_block_depth, cond_dim=dim
+        self.linear_attn_4km = XCAttention(
+            dim=dim,
+            cond_dim=lead_time_embed_dim,
+            dim_head=attn_dim_head,
+            heads=attn_heads,
+            dropout=attn_dropout
         )
 
-        # 2배 다운샘플 후 다시 업샘플
-        self.downsample = nn.MaxPool2d(kernel_size=2, stride=2)
-        self.upsample = nn.Upsample(scale_factor=upsample_scale_factor, mode='bilinear', align_corners=False)
-
-        # low_input 임베딩
-        self.low_input_embed = nn.Conv2d(
-            self.input_channels_low, dim, kernel_size=1
+        self.downsample_and_pad_to_8km = Sequential(
+            Downsample2x(),
+            CenterPad(input_spatial_size)
         )
 
-        # concat 후 2개의 ResNet 블록 통과 (cond_dim 추가)
-        self.resnet_blocks2 = ResnetBlocks(
-            dim=dim * 2, depth=resnet_block_depth, cond_dim=dim
+        dim_in_8km = input_4996_channels + dim
+
+        self.resnet_blocks_down_8km = ResnetBlocks(
+            dim=dim,
+            dim_in=dim_in_8km,
+            cond_dim=lead_time_embed_dim,
+            depth=resnet_block_depth
         )
 
-        # 2배 다운샘플
-        self.downsample2 = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.downsample_to_16km = Downsample2x()
 
-        # 12개의 MaxViT 블록 통과 (cond_dim 추가)
         self.vit = MaxViT(
-            dim=dim * 2,
+            dim=dim,
             depth=attn_depth,
             dim_head=attn_dim_head,
             heads=attn_heads,
             dropout=attn_dropout,
+            cond_dim=lead_time_embed_dim,
             window_size=vit_window_size,
-            cond_dim=dim  # cond_dim 추가
+            mbconv_expansion_rate=vit_mbconv_expansion_rate,
+            mbconv_shrinkage_rate=vit_mbconv_shrinkage_rate,
         )
 
-        # 2배 업샘플
-        self.upsample2 = nn.Upsample(scale_factor=upsample_scale_factor, mode='bilinear', align_corners=False)
+        self.crop_post_16km = CenterCrop(crop_size_post_16km)
 
-        # 2개의 ResNet 블록 통과 (cond_dim 추가)
-        self.resnet_blocks3 = ResnetBlocks(
-            dim=dim * 2, depth=resnet_block_depth, cond_dim=dim
+        self.upsample_16km_to_8km = Upsample2x(dim)
+
+        self.to_skip_connect_8km = CenterCrop(crop_size_post_16km * 2)
+
+        self.resnet_blocks_up_8km = ResnetBlocks(
+            dim=dim,
+            dim_in=dim + dim_in_8km,
+            cond_dim=lead_time_embed_dim,
+            depth=resnet_block_depth
         )
 
-        # 센터 크롭
-        self.center_crop = CenterCrop(crop_size_post)
-
-        # surface_target과 dense_target 결과 생성
-        self.to_surface_target = nn.Conv2d(dim * 2, self.target_channels_sparse, kernel_size=1)
-        self.to_dense_target = nn.Conv2d(dim * 2, self.target_channels_dense, kernel_size=1)
-
-        # 2배 업샘플
-        self.upsample3 = nn.Upsample(scale_factor=upsample_scale_factor, mode='bilinear', align_corners=False)
-
-        # 2개의 ResNet 블록 통과 (cond_dim 추가)
-        self.resnet_blocks4 = ResnetBlocks(
-            dim=dim * 2, depth=resnet_block_depth, cond_dim=dim
+        self.linear_attn_8km = XCAttention(
+            dim=dim,
+            cond_dim=lead_time_embed_dim
         )
 
-        # high_target 결과 생성
-        self.to_high_target = nn.Conv2d(dim * 2, self.target_channels_high, kernel_size=1)
+        self.upsample_8km_to_4km = Upsample2x(dim)
 
-    def forward(self, sparse_input, dense_input, low_input, lead_times):
-        # 리드 타임 임베딩
-        cond = self.lead_time_embedding(lead_times).squeeze(1)
+        self.crop_post_4km = CenterCrop(surface_and_hrrr_target_spatial_size)
 
-        # 임베딩 및 concat
-        x = torch.cat([sparse_input, dense_input], dim=1)
-        # print(f"Input concatenated shape: {x.shape}")  
-        x = self.sparse_dense_embed(x)
-        # print(f"After sparse_dense_embed: {x.shape}")  
+        self.resnet_blocks_up_4km = ResnetBlocks(
+            dim=dim,
+            dim_in=dim + dim_in_4km,
+            cond_dim=lead_time_embed_dim,
+            depth=resnet_block_depth
+        )
 
-        #  블록 통과
-        x = self.resnet_blocks1(x, cond=cond)
-        # print(f"After resnet_blocks1: {x.shape}")  
+        self.upsample_4x_to_1km = nn.ConvTranspose2d(dim, dim, kernel_size=4, stride=4)
 
-        # 다운샘플 및 업샘플
-        x_down = self.downsample(x)
-        # print(f"After downsample: {x_down.shape}")  
-        x_up = self.upsample(x_down)
-        # print(f"After upsample: {x_up.shape}")  
+        self.resnet_blocks_up_1km = ResnetBlocks(
+            dim=dim,
+            depth=resnet_block_depth,
+            cond_dim=lead_time_embed_dim
+        )
 
-        # low_input 임베딩
-        low_embedded = self.low_input_embed(low_input)
-        # print(f"Low input embedded shape: {low_embedded.shape}")  
+        # following section b.1
 
-        # concat 및 ResNet 블록 통과
-        x = torch.cat([x_up, low_embedded], dim=1)
-        # print(f"After concatenating low input: {x.shape}")  
-        x = self.resnet_blocks2(x, cond=cond)
-        # print(f"After resnet_blocks2: {x.shape}")  
+        # targets 1km (mrms)
 
-        # 다운샘플
-        x = self.downsample2(x)
-        # print(f"After downsample2: {x.shape}") 
+        self.precipitation_bin_names = tuple(precipitation_target_bins.keys())
+        self.precipitation_bin_dims = tuple(precipitation_target_bins.values())
 
-        # MaxViT 블록 통과
+        self.to_precipitation_bins = Sequential(
+            ChanLayerNorm(dim),
+            nn.Conv2d(dim, sum(self.precipitation_bin_dims), 1)
+        )
+
+        # targets 4km (omo)
+
+        self.surface_bin_names = tuple(surface_target_bins.keys())
+        self.surface_bin_dims = tuple(surface_target_bins.values())
+
+        self.to_surface_bins = Sequential(
+            ChanLayerNorm(dim),
+            nn.Conv2d(dim, sum(self.surface_bin_dims), 1)
+        )
+
+        # to hrrr channels for MSE loss
+
+        self.to_hrrr_pred = Sequential(
+            ChanLayerNorm(dim),
+            nn.Conv2d(dim, hrrr_channels, 1)
+        )
+
+        # they scale hrrr loss by 10. but also divided by number of channels
+
+        self.hrrr_loss_weight = hrrr_loss_weight / hrrr_channels
+
+        self.mse_loss_scaler = LossScaler()
+
+        # norm statistics
+
+        default_hrrr_statistics = torch.empty((2, hrrr_channels), dtype=torch.float32)
+
+        if hrrr_norm_strategy == 'none':
+            self.register_buffer('hrrr_norm_statistics', default_hrrr_statistics, persistent=False)
+
+        elif hrrr_norm_strategy == 'precalculated':
+            assert exists(
+                hrrr_norm_statistics), 'hrrr_norm_statistics must be passed in, if normalizing input hrrr as well as target with precalculated dataset mean and variance'
+            assert hrrr_norm_statistics.shape == (2,
+                                                  hrrr_channels), f'normalization statistics must be of shape (2, {hrrr_channels}), containing mean and variance of each target calculated from the dataset'
+            self.register_buffer('hrrr_norm_statistics', hrrr_norm_statistics)
+
+        elif hrrr_norm_strategy == 'sync_batchnorm':
+            self.register_buffer('hrrr_norm_statistics', default_hrrr_statistics, persistent=False)
+            self.batchnorm_hrrr = MaybeSyncBatchnorm2d()(hrrr_channels, affine=False)
+
+        self.hrrr_norm_strategy = hrrr_norm_strategy
+
+    @classmethod
+    def init_and_load_from(cls, path, strict=True):
+        path = Path(path)
+        assert path.exists()
+        pkg = torch.load(str(path), map_location='cpu')
+
+        assert 'config' in pkg, 'model configs were not found in this saved checkpoint'
+
+        config = pickle.loads(pkg['config'])
+        tokenizer = cls(**config)
+        tokenizer.load(path, strict=strict)
+        return tokenizer
+
+    def save(self, path, overwrite=True):
+        path = Path(path)
+        assert overwrite or not path.exists(), f'{str(path)} already exists'
+
+        pkg = dict(
+            model_state_dict=self.state_dict(),
+            config=self._configs
+        )
+
+        torch.save(pkg, str(path))
+
+    def load(self, path, strict=True):
+        path = Path(path)
+        assert path.exists()
+
+        pkg = torch.load(str(path))
+        state_dict = pkg.get('model_state_dict')
+
+        assert exists(state_dict)
+
+        self.load_state_dict(state_dict, strict=strict)
+
+    @beartype
+    def forward(
+            self,
+            *,
+            lead_times,
+            hrrr_input_2496,
+            hrrr_stale_state,
+            input_2496,
+            input_4996,
+            surface_targets: Optional[Dict[str, Tensor]] = None,
+            precipitation_targets: Optional[Dict[str, Tensor]] = None,
+            hrrr_target: Optional[Tensor] = None,
+    ):
+        batch = lead_times.shape[0]
+
+        assert batch == hrrr_input_2496.shape[0] == input_2496.shape[0] == input_4996.shape[
+            0], 'batch size across all inputs must be the same'
+
+        assert hrrr_input_2496.shape[1:] == self.hrrr_input_2496_shape
+        assert input_2496.shape[1:] == self.input_2496_shape
+        assert input_4996.shape[1:] == self.input_4996_shape
+
+        # normalize HRRR input and target, if needed
+
+        if self.hrrr_norm_strategy == 'precalculated':
+            mean, variance = self.hrrr_norm_statistics
+            mean = rearrange(mean, 'c -> c 1 1')
+            variance = rearrange(variance, 'c -> c 1 1')
+            inv_std = variance.clamp(min=1e-5).rsqrt()
+
+            normed_hrrr_input = (hrrr_input_2496 - mean) * inv_std
+
+            if exists(hrrr_target):
+                normed_hrrr_target = (hrrr_target - mean) * inv_std
+
+        elif self.hrrr_norm_strategy == 'sync_batchnorm':
+            # use a batchnorm to normalize each channel to mean zero and unit variance
+
+            with freeze_batchnorm(self.batchnorm_hrrr) as frozen_batchnorm:
+                normed_hrrr_input = frozen_batchnorm(hrrr_input_2496)
+
+                if exists(hrrr_target):
+                    normed_hrrr_target = frozen_batchnorm(hrrr_target)
+
+        elif self.hrrr_norm_strategy == 'none':
+            normed_hrrr_input = hrrr_input_2496
+
+            if exists(hrrr_target):
+                normed_hrrr_target = hrrr_target
+
+        # main network
+
+        cond = self.lead_time_embedding(lead_times)
+
+        x = torch.cat((normed_hrrr_input, hrrr_stale_state, input_2496), dim=1)
+
+        skip_connect_4km = self.to_skip_connect_4km(x)
+
+        x = self.resnet_blocks_down_4km(x, cond=cond)
+
+        x = self.linear_attn_4km(x, cond=cond) + x
+
+        x = self.downsample_and_pad_to_8km(x)
+
+        x = torch.cat((input_4996, x), dim=1)
+
+        skip_connect_8km = self.to_skip_connect_8km(x)
+
+        x = self.resnet_blocks_down_8km(x, cond=cond)
+
+        x = self.downsample_to_16km(x)
+
         x = self.vit(x, cond=cond)
-        # print(f"After MaxViT: {x.shape}") 
 
-        # 업샘플
-        x = self.upsample2(x)
-        # print(f"After upsample2: {x.shape}")  
+        x = self.crop_post_16km(x)
 
-        # 5.9 ResNet 블록 통과
-        x = self.resnet_blocks3(x, cond=cond)
-        # print(f"After resnet_blocks3: {x.shape}")  
+        x = self.upsample_16km_to_8km(x)
 
-        # 센터 크롭
-        x_cropped = self.center_crop(x)
-        # print(f"After center_crop: {x_cropped.shape}")  
+        x = torch.cat((skip_connect_8km, x), dim=1)
 
-        # 타겟 생성
-        surface_pred = self.to_surface_target(x_cropped)
-        # print(f"Surface prediction shape: {surface_pred.shape}")  
-        dense_pred = self.to_dense_target(x_cropped)
-        # print(f"Dense prediction shape: {dense_pred.shape}")  
+        x = self.resnet_blocks_up_8km(x, cond=cond)
 
-        # 업샘플
-        x = self.upsample3(x_cropped)
-        # print(f"After upsample3: {x.shape}")  
+        x = self.linear_attn_8km(x, cond=cond) + x
 
-        # ResNet 블록 통과
-        x = self.resnet_blocks4(x, cond=cond)
-        # print(f"After resnet_blocks4: {x.shape}")  
+        x = self.upsample_8km_to_4km(x)
 
-        # high_target 생성
-        high_pred = self.to_high_target(x)
-        # print(f"High prediction shape: {high_pred.shape}")  
+        x = torch.cat((skip_connect_4km, x), dim=1)
 
-        return surface_pred, dense_pred, high_pred
+        x = self.resnet_blocks_up_4km(x, cond=cond)
+
+        x = self.crop_post_4km(x)
+
+        hrrr_pred = self.to_hrrr_pred(x)
+
+        surface_bins = self.to_surface_bins(x).split(self.surface_bin_dims, dim=1)
+
+        surface_preds = dict(zip(self.surface_bin_names, surface_bins))
+
+        x = self.upsample_4x_to_1km(x)
+
+        x = self.resnet_blocks_up_1km(x, cond=cond)
+
+        precipitation_bins = self.to_precipitation_bins(x).split(self.precipitation_bin_dims, dim=1)
+
+        precipitation_preds = dict(zip(self.precipitation_bin_names, precipitation_bins))
+
+        exist_targets = [exists(target) for target in (surface_targets, hrrr_target, precipitation_targets)]
+
+        pred = Predictions(surface_preds, hrrr_pred, precipitation_preds)
+
+        if not any(exist_targets):
+            return pred
+
+        assert all(exist_targets), 'all targets must be passed in for loss calculation'
+
+        assert hrrr_target.shape[1:] == self.hrrr_target_shape
+
+        assert set(self.surface_bin_names) == set(surface_targets.keys())
+
+        assert set(self.precipitation_bin_names) == set(precipitation_targets.keys())
+
+        # calculate categorical losses
+
+        ce_losses = 0.
+
+        surface_loss_breakdown = dict()
+        precipitation_loss_breakdown = dict()
+
+        for surface_bin_name in self.surface_bin_names:
+            surface_pred = surface_preds[surface_bin_name]
+            surface_target = surface_targets[surface_bin_name]
+
+            assert surface_target.shape[0] == batch
+            assert surface_target.shape[1:] == self.surface_target_shape
+
+            surface_pred = rearrange(surface_pred, '... h w -> ... (h w)')
+            surface_target = rearrange(surface_target, '... h w -> ... (h w)')
+            surface_loss = F.cross_entropy(surface_pred, surface_target)
+
+            surface_loss_breakdown[surface_bin_name] = surface_loss
+
+            ce_losses = ce_losses + surface_loss
+
+        for precipitation_bin_name in self.precipitation_bin_names:
+            precipitation_pred = precipitation_preds[precipitation_bin_name]
+            precipitation_target = precipitation_targets[precipitation_bin_name]
+
+            assert precipitation_target.shape[0] == batch
+            assert precipitation_target.shape[1:] == self.precipitation_target_shape
+
+            precipitation_pred = rearrange(precipitation_pred, '... h w -> ... (h w)')
+            precipitation_target = rearrange(precipitation_target, '... h w -> ... (h w)')
+
+            precipition_loss = F.cross_entropy(precipitation_pred, precipitation_target)
+
+            precipitation_loss_breakdown[precipitation_bin_name] = precipition_loss
+
+            ce_losses = ce_losses + precipition_loss
+
+        # calculate HRRR mse loss
+        # proposed loss gradient rescaler from section 4.3.2
+
+        hrrr_pred = self.mse_loss_scaler(hrrr_pred)
+
+        hrrr_loss = F.mse_loss(hrrr_pred, normed_hrrr_target)
+
+        # update hrrr normalization statistics, if using batchnorm way
+
+        if self.training and self.hrrr_norm_strategy == 'sync_batchnorm':
+            _ = self.batchnorm_hrrr(hrrr_target)
+
+        # total loss
+
+        total_loss = ce_losses + hrrr_loss * self.hrrr_loss_weight
+
+        loss_breakdown = LossBreakdown(surface_loss_breakdown, hrrr_loss, precipitation_loss_breakdown)
+
+        return total_loss, loss_breakdown
